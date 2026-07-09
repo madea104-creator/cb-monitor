@@ -1,0 +1,43 @@
+name: Weekly Conv Price Refresh
+
+on:
+  schedule:
+    # UTC 02:00 週六 = 台灣週六 10:00（避開平日，對 MOPS 溫柔一點）
+    - cron: "0 2 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests pandas lxml
+
+      - name: Refresh conversion prices (new + stale > 7 days)
+        run: python fetch_conv_prices.py --db cb_openapi.db --stale-days 7
+
+      - name: Regenerate dashboard
+        run: python generate_cb_html.py --db cb_openapi.db --out index.html
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add cb_openapi.db index.html
+          if git diff --cached --quiet; then
+            echo "No changes, skip commit."
+          else
+            git commit -m "Weekly conv price refresh $(date +'%Y-%m-%d')"
+            git push
+          fi

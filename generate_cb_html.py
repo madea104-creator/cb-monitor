@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-generate_cb_html.py
-讀取 cb_openapi.db（cb_snapshot_ingest.py 累積的每日快照），
-產生單檔 HTML 儀表板 cb_dashboard.html。
+generate_cb_html.py  (v2)
+讀取 cb_openapi.db（每日快照 + 轉換價格歷史），產生單檔 HTML 儀表板。
 
-特色：
-  * 餘額消化率量條（1 - 餘額/發行額）— 掃描強勢 CB
-  * 與前一次快照的餘額變動（Δ）自動標示
-  * 搜尋（代碼/簡稱/發行人）、快速篩選、多欄排序
-  * 點列展開：該檔 CB 的逐日餘額歷史（隨快照累積增長）
-  * 純單檔、零外部依賴，可直接丟 GitHub Pages
+v2 新增：
+  * 「目前轉換價」欄（取重設生效日 <= 今天的最新一筆；已公告未來重設顯示 ↻）
+  * 「即將重設」快速篩選
+  * 點列展開明細加入「轉換價格重設歷史」表
+  * 表頭固定（表格區內部捲動）
+  * 修正欄位名 Conversion_ExchangePriceAtIssuance
 
 用法：
   python generate_cb_html.py
@@ -35,7 +34,6 @@ def num(v):
 
 
 def fmt_date(s):
-    """20260706 → 2026/07/06；其他格式原樣返回"""
     s = str(s or "").strip()
     if len(s) == 8 and s.isdigit():
         return f"{s[:4]}/{s[4:6]}/{s[6:]}"
@@ -62,13 +60,24 @@ def load(db_path):
         ):
             prev_out[r[0]] = num(r[1])
 
-    # 每檔的餘額歷史（全部快照）
     hist = {}
     for r in conn.execute(
         "SELECT bond_code, snapshot_date, OutstandingAmount FROM cb_snapshot ORDER BY snapshot_date"
     ):
         hist.setdefault(r[0], []).append([fmt_date(r[1]), num(r[2])])
 
+    conv = {}
+    has_conv = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='conv_price'"
+    ).fetchone()[0]
+    if has_conv:
+        for r in conn.execute(
+            "SELECT bond_code, reset_date, price, kind FROM conv_price ORDER BY reset_date DESC"
+        ):
+            conv.setdefault(r[0], []).append(
+                {"date": r[1], "price": r[2], "kind": r[3] or ""})
+
+    today_iso = dt.date.today().isoformat()
     bonds = []
     for r in rows:
         code = r["bond_code"]
@@ -76,6 +85,12 @@ def load(db_path):
         digest = (1 - out / issue) if (issue and out is not None and issue > 0) else None
         p = prev_out.get(code)
         delta = (out - p) if (out is not None and p is not None) else None
+
+        ch = conv.get(code, [])
+        conv_now = next((x for x in ch if x["date"] <= today_iso), None)
+        future = [x for x in ch if x["date"] > today_iso]
+        conv_next = future[-1] if future else None
+
         bonds.append({
             "code": code,
             "name": r["ShortName"] or "",
@@ -88,7 +103,10 @@ def load(db_path):
             "put_price": num(r["PutOptionPrice"]),
             "maturity": fmt_date(r["MaturityDate"]),
             "listing": fmt_date(r["ListingDate"]),
-            "conv_price": num(r["Conversion_ExchangePriceAtIssuance"]),
+            "conv_issue": num(r["Conversion_ExchangePriceAtIssuance"]),
+            "conv_now": conv_now["price"] if conv_now else None,
+            "conv_next": conv_next,
+            "conv_hist": ch,
             "chg_date": fmt_date(r["OutstandingChangeDate"]),
             "chg_desc": r["OutstandingChangeDescription"] or "",
             "underwriter": r["Underwriter"] or "",
@@ -116,17 +134,15 @@ body{background:var(--paper);color:var(--ink);
   font-size:14px;line-height:1.45}
 .num{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-variant-numeric:tabular-nums}
 
-/* ── 報頭 ── */
 header{background:var(--card);border-bottom:3px double var(--tpex);padding:20px 24px 14px}
-.mast{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 18px;max-width:1200px;margin:0 auto}
+.mast{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 18px;max-width:1280px;margin:0 auto}
 .mast h1{font-family:"Noto Serif TC","PMingLiU",serif;font-size:24px;font-weight:700;
   letter-spacing:.14em;color:var(--tpex)}
 .mast .snap{color:var(--ink2);font-size:13px}
 .mast .stats{margin-left:auto;display:flex;gap:18px;font-size:13px;color:var(--ink2)}
 .mast .stats b{color:var(--ink);font-size:16px}
 
-/* ── 工具列 ── */
-.toolbar{max-width:1200px;margin:14px auto 0;padding:0 24px;
+.toolbar{max-width:1280px;margin:14px auto 0;padding:0 24px;
   display:flex;flex-wrap:wrap;gap:8px;align-items:center}
 .toolbar input{flex:1;min-width:180px;padding:8px 12px;border:1px solid var(--line);
   border-radius:6px;font-size:14px;background:var(--card)}
@@ -137,10 +153,10 @@ header{background:var(--card);border-bottom:3px double var(--tpex);padding:20px 
 .chip.on{background:var(--tpex);border-color:var(--tpex);color:#fff}
 .chip:focus-visible{outline:2px solid var(--tpex);outline-offset:2px}
 
-/* ── 表格 ── */
-.wrap{max-width:1200px;margin:12px auto 60px;padding:0 24px}
-.tablecard{background:var(--card);border:1px solid var(--line);border-radius:8px;overflow:auto;max-height:calc(100vh - 215px)}
-table{width:100%;border-collapse:collapse;min-width:980px}
+.wrap{max-width:1280px;margin:12px auto 60px;padding:0 24px}
+.tablecard{background:var(--card);border:1px solid var(--line);border-radius:8px;
+  overflow:auto;max-height:calc(100vh - 215px)}
+table{width:100%;border-collapse:collapse;min-width:1080px}
 thead th{position:sticky;top:0;z-index:2;background:var(--card);border-bottom:2px solid var(--ink);
   padding:10px 10px;text-align:right;font-size:12.5px;color:var(--ink2);
   white-space:nowrap;cursor:pointer;user-select:none}
@@ -151,29 +167,31 @@ tbody td:first-child,tbody td:nth-child(2){text-align:left}
 tbody tr.row{cursor:pointer}
 tbody tr.row:hover{background:#F6F9FC}
 .codecell b{color:var(--tpex)}
-.codecell span{color:var(--ink2);font-size:12px;margin-left:6px}
 
-/* 消化率量條 —— 招牌元素 */
 .gauge{display:inline-flex;align-items:center;gap:8px;justify-content:flex-end;width:150px}
 .gauge .bar{flex:1;height:8px;border-radius:4px;background:var(--gauge-bg);overflow:hidden}
 .gauge .bar i{display:block;height:100%;background:var(--gauge)}
 .gauge .pct{width:48px;font-size:12.5px}
 .d-up{color:var(--up)} .d-dn{color:var(--dn)} .muted{color:var(--ink2)}
 .putsoon{color:var(--up);font-weight:600}
+.resetmark{color:var(--up);font-weight:700;cursor:help}
 
-/* 展開明細 */
 tr.detail td{background:#F8FAFC;padding:14px 18px;text-align:left}
 .dgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:6px 22px;
-  font-size:13px;margin-bottom:10px}
+  font-size:13px;margin-bottom:12px}
 .dgrid span{color:var(--ink2)}
+.dtables{display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start}
 .htable{border-collapse:collapse;min-width:0}
+.htable caption{text-align:left;font-size:12.5px;color:var(--ink2);padding-bottom:4px;font-weight:600}
 .htable th,.htable td{border:1px solid var(--line);padding:4px 10px;font-size:12.5px;text-align:right}
 .htable th{background:var(--chip);color:var(--ink2);font-weight:500}
+.nextreset{font-size:12.5px;color:var(--up);margin-top:6px}
 .empty{padding:40px;text-align:center;color:var(--ink2)}
-footer{max-width:1200px;margin:0 auto 40px;padding:0 24px;font-size:12px;color:var(--ink2)}
+footer{max-width:1280px;margin:0 auto 40px;padding:0 24px;font-size:12px;color:var(--ink2)}
 @media (max-width:640px){
   header{padding:14px 14px 10px}.mast h1{font-size:19px}
   .toolbar,.wrap,footer{padding:0 10px}.mast .stats{width:100%;margin-left:0}
+  .tablecard{max-height:calc(100vh - 250px)}
 }
 @media (prefers-reduced-motion:no-preference){
   .gauge .bar i{transition:width .4s ease}
@@ -184,7 +202,7 @@ footer{max-width:1200px;margin:0 auto 40px;padding:0 24px;font-size:12px;color:v
 <header>
   <div class="mast">
     <h1>可轉債快照</h1>
-    <div class="snap">快照日 __LATEST__ __PREVNOTE__ ・ 資料：櫃買中心 OpenAPI</div>
+    <div class="snap">快照日 __LATEST__ __PREVNOTE__ ・ 資料：櫃買中心 OpenAPI + MOPS</div>
     <div class="stats">
       <div>掛牌 <b id="stTotal">–</b> 檔</div>
       <div>本次變動 <b id="stChanged">–</b> 檔</div>
@@ -200,6 +218,7 @@ footer{max-width:1200px;margin:0 auto 40px;padding:0 24px;font-size:12px;color:v
     <button class="chip" data-f="changed">本次有變動</button>
     <button class="chip" data-f="hot">消化率 &gt; 80%</button>
     <button class="chip" data-f="putsoon">賣回日 180 天內</button>
+    <button class="chip" data-f="resetsoon">即將重設</button>
   </div>
 </div>
 
@@ -213,7 +232,8 @@ footer{max-width:1200px;margin:0 auto 40px;padding:0 24px;font-size:12px;color:v
         <th data-s="out">餘額</th>
         <th data-s="delta">Δ餘額</th>
         <th data-s="digest">消化率</th>
-        <th data-s="conv_price">發行轉換價</th>
+        <th data-s="conv_now">目前轉換價</th>
+        <th data-s="conv_issue">發行轉換價</th>
         <th data-s="put_date">賣回日</th>
         <th data-s="maturity">到期日</th>
       </tr></thead>
@@ -223,13 +243,14 @@ footer{max-width:1200px;margin:0 auto 40px;padding:0 24px;font-size:12px;color:v
   </div>
 </div>
 
-<footer>消化率 = 1 − 餘額 ÷ 發行額。Δ餘額為與前一次快照之比較；每日執行 cb_snapshot_ingest.py 後重新產生本頁即可累積歷史。</footer>
+<footer>消化率 = 1 − 餘額 ÷ 發行額。目前轉換價取重設生效日 ≤ 今日之最新值，↻ 表示已公告未來重設（點列展開可見）。轉換價資料來源：公開資訊觀測站。</footer>
 
 <script>
 const DATA = __DATA__;
 const today = new Date("__TODAY__");
 const fmtA = v => v==null ? "–" : (v/1e8).toFixed(2)+" 億";
 const fmtD = v => v==null ? "–" : (v>0?"+":"−")+(Math.abs(v)/1e6).toFixed(1)+" 百萬";
+const fmtP = v => v==null ? "–" : (v>=100 ? v.toFixed(1) : v.toFixed(2));
 const putDays = s => { if(!s) return null;
   const d=new Date(s.replaceAll("/","-")); return isNaN(d)?null:Math.round((d-today)/864e5); };
 
@@ -240,9 +261,10 @@ function rows(){
   let r=DATA.filter(b=>{
     if(query){ const q=query.toLowerCase();
       if(!(b.code.includes(q)||b.name.toLowerCase().includes(q)||b.issuer.toLowerCase().includes(q))) return false; }
-    if(filter==="changed") return b.delta!=null && b.delta!==0;
-    if(filter==="hot")     return b.digest!=null && b.digest>80;
-    if(filter==="putsoon"){ const d=putDays(b.put_date); return d!=null && d>=0 && d<=180; }
+    if(filter==="changed")   return b.delta!=null && b.delta!==0;
+    if(filter==="hot")       return b.digest!=null && b.digest>80;
+    if(filter==="putsoon"){  const d=putDays(b.put_date); return d!=null && d>=0 && d<=180; }
+    if(filter==="resetsoon") return b.conv_next!=null;
     return true;
   });
   r.sort((a,b)=>{
@@ -266,6 +288,8 @@ function render(){
     const putCls=(d!=null&&d>=0&&d<=180)?"putsoon":"";
     const deltaCls=b.delta==null?"muted":(b.delta<0?"d-up":"d-dn");
     const open=openCode===b.code;
+    const resetMark=b.conv_next
+      ? `<span class="resetmark" title="將於 ${b.conv_next.date} 重設為 ${b.conv_next.price}">↻</span>` : "";
     let html=`<tr class="row" data-code="${b.code}" aria-expanded="${open}">
       <td class="codecell"><b class="num">${b.code}</b> ${b.name}</td>
       <td>${b.issuer}</td>
@@ -273,19 +297,29 @@ function render(){
       <td class="num">${fmtA(b.out)}</td>
       <td class="num ${deltaCls}">${b.delta==null?"–":fmtD(b.delta)}</td>
       <td>${gauge(b.digest)}</td>
-      <td class="num">${b.conv_price==null?"–":b.conv_price.toFixed(2)}</td>
+      <td class="num">${fmtP(b.conv_now)} ${resetMark}</td>
+      <td class="num muted">${fmtP(b.conv_issue)}</td>
       <td class="num ${putCls}">${b.put_date||"–"}${d!=null&&d>=0?`<span class="muted"> (${d}天)</span>`:""}</td>
       <td class="num">${b.maturity||"–"}</td></tr>`;
     if(open){
       const h=b.hist.map(x=>`<tr><td class="num">${x[0]}</td><td class="num">${x[1]==null?"–":x[1].toLocaleString()}</td></tr>`).join("");
-      html+=`<tr class="detail"><td colspan="9">
+      const cv=b.conv_hist.map(x=>`<tr><td class="num">${x.date}</td><td class="num">${fmtP(x.price)}</td><td>${x.kind}</td></tr>`).join("");
+      const nextNote=b.conv_next
+        ? `<div class="nextreset">↻ 已公告：${b.conv_next.date} 起重設為 ${fmtP(b.conv_next.price)}（${b.conv_next.kind}）</div>` : "";
+      html+=`<tr class="detail"><td colspan="10">
         <div class="dgrid">
           <div><span>賣回價</span> <span class="num" style="color:var(--ink)">${b.put_price==null?"–":b.put_price.toFixed(2)}</span></div>
           <div><span>掛牌日</span> ${b.listing||"–"}</div>
           <div><span>承銷商</span> ${b.underwriter||"–"}</div>
           <div><span>餘額最後變動</span> ${b.chg_date||"–"} ${b.chg_desc}</div>
         </div>
-        <table class="htable"><thead><tr><th>快照日</th><th>餘額 (元)</th></tr></thead><tbody>${h}</tbody></table>
+        <div class="dtables">
+          <table class="htable"><caption>餘額快照歷史</caption>
+            <thead><tr><th>快照日</th><th>餘額 (元)</th></tr></thead><tbody>${h}</tbody></table>
+          ${cv ? `<div><table class="htable"><caption>轉換價格重設歷史</caption>
+            <thead><tr><th>生效日</th><th>轉換價</th><th>類型</th></tr></thead><tbody>${cv}</tbody></table>${nextNote}</div>`
+               : `<div class="muted" style="font-size:12.5px">尚無轉換價資料（跑 fetch_conv_prices.py 後出現）</div>`}
+        </div>
       </td></tr>`;
     }
     return html;
